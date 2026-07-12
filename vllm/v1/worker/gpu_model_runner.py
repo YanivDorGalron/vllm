@@ -2550,9 +2550,13 @@ class GPUModelRunner(
                         spec_decode_common_attn_metadata = cm
                 else:
                     spec_decode_common_attn_metadata = cm
-            # Capture per-group block tables for multi-group proposers.
-            if self.speculative_config and isinstance(self.drafter, Step3p5MTPProposer):
-                self.drafter.set_per_group_attn_metadata(
+            # Capture per-group block tables/slot mappings for multi-group proposers.
+            if self.speculative_config and callable(
+                set_per_group_attn_metadata := getattr(
+                    self.drafter, "set_per_group_attn_metadata", None
+                )
+            ):
+                set_per_group_attn_metadata(
                     kv_cache_gid, cm.block_table_tensor, cm.slot_mapping
                 )
             elif self.speculative_config and isinstance(self.drafter, Gemma4Proposer):
