@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""NemotronH-MTP model with attention layers."""
+"""NemotronH-MTP model."""
 
+import copy
 import typing
 from collections.abc import Callable, Iterable
 
@@ -33,14 +34,155 @@ from vllm.transformers_utils.configs.nemotron_h import NemotronHConfig
 from .interfaces import SupportsPP
 from .nemotron_h import (
     NemotronHAttentionDecoderLayer,
+    NemotronHMLPDecoderLayer,
     NemotronHMoEDecoderLayer,
 )
 
+_MTP_FFN_ROUNDING = 32
 
-class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
+
+def _scale_mtp_ffn_width(width: int, inner_hidden_size: int, hidden_size: int) -> int:
+    """Scale an MTP FFN width by d/H and round up to a fixed multiple."""
+    denominator = hidden_size * _MTP_FFN_ROUNDING
+    return (
+        (width * inner_hidden_size + denominator - 1) // denominator
+    ) * _MTP_FFN_ROUNDING
+
+
+def _get_mtp_inner_config(config: NemotronHConfig) -> NemotronHConfig:
+    """Build the TP-independent configuration used by the inner MTP stack."""
+    inner_config = copy.deepcopy(config)
+    pattern = config.mtp_hybrid_override_pattern
+    inner_config.hybrid_override_pattern = pattern.replace("W", "*")
+    inner_config.num_hidden_layers = len(pattern)
+
+    bottleneck_hidden_size = getattr(config, "mtp_bottleneck_hidden_size", None)
+    if bottleneck_hidden_size is not None:
+        inner_config.hidden_size = bottleneck_hidden_size
+        inner_config.intermediate_size = _scale_mtp_ffn_width(
+            config.intermediate_size,
+            bottleneck_hidden_size,
+            config.hidden_size,
+        )
+        inner_config.moe_intermediate_size = _scale_mtp_ffn_width(
+            config.moe_intermediate_size,
+            bottleneck_hidden_size,
+            config.hidden_size,
+        )
+
+    return inner_config
+
+
+def _get_mtp_layer_config(
+    inner_config: NemotronHConfig,
+    outer_config: NemotronHConfig,
+    layer_symbol: str,
+) -> NemotronHConfig:
+    """Return an inner config with the correct per-layer attention window."""
+    layer_config = copy.deepcopy(inner_config)
+    if layer_symbol == "W":
+        # Megatron stores (left, right), while vLLM's scalar includes the
+        # current token and is converted by backends to (scalar - 1, 0).
+        layer_config.sliding_window = outer_config.mtp_window_size[0] + 1
+    else:
+        layer_config.sliding_window = None
+    return layer_config
+
+
+class _NemotronHMTPDecoderLayerMixin:
+    """Shared MTP projections around a decoder layer."""
+
+    def _init_mtp_projections(
+        self,
+        config: NemotronHConfig,
+        outer_config: NemotronHConfig,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+        has_start_projections: bool,
+        has_end_norm: bool,
+    ) -> None:
+        self.has_start_projections = has_start_projections
+        self.has_end_norm = has_end_norm
+        self.use_bottleneck = (
+            getattr(outer_config, "mtp_bottleneck_hidden_size", None) is not None
+        )
+
+        if has_start_projections:
+            self.enorm = RMSNorm(
+                outer_config.hidden_size, eps=outer_config.layer_norm_epsilon
+            )
+            self.hnorm = RMSNorm(
+                outer_config.hidden_size, eps=outer_config.layer_norm_epsilon
+            )
+
+            self.eh_proj = ColumnParallelLinear(
+                input_size=outer_config.hidden_size * 2,
+                output_size=config.hidden_size,
+                bias=False,
+                gather_output=True,
+                params_dtype=outer_config.dtype
+                if hasattr(outer_config, "dtype")
+                else torch.bfloat16,
+                quant_config=quant_config,
+                prefix=f"{prefix}.eh_proj",
+            )
+
+        if has_end_norm:
+            if self.use_bottleneck:
+                self.he_proj = ColumnParallelLinear(
+                    input_size=config.hidden_size,
+                    output_size=outer_config.hidden_size,
+                    bias=False,
+                    gather_output=True,
+                    params_dtype=outer_config.dtype
+                    if hasattr(outer_config, "dtype")
+                    else torch.bfloat16,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.he_proj",
+                )
+            self.final_layernorm = RMSNorm(
+                outer_config.hidden_size,
+                eps=getattr(outer_config, "layer_norm_epsilon", 1e-5),
+            )
+
+    def _project_mtp_inputs(
+        self,
+        inputs_embeds: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.has_start_projections:
+            assert inputs_embeds is not None
+            inputs_embeds_normed = self.enorm(inputs_embeds)
+            previous_hidden_states_normed = self.hnorm(hidden_states)
+            fused = torch.cat(
+                [inputs_embeds_normed, previous_hidden_states_normed], dim=-1
+            )
+            hidden_states, _ = self.eh_proj(fused)
+        return hidden_states
+
+    def _finalize_mtp_outputs(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.has_end_norm:
+            if residual is not None:
+                hidden_states = hidden_states + residual
+                residual = None
+            if self.use_bottleneck:
+                hidden_states, _ = self.he_proj(hidden_states)
+            hidden_states = self.final_layernorm(hidden_states)
+
+        return hidden_states, residual
+
+
+class NemotronHMTPAttentionDecoderLayer(
+    _NemotronHMTPDecoderLayerMixin, NemotronHAttentionDecoderLayer
+):
     def __init__(
         self,
         config: NemotronHConfig,
+        outer_config: NemotronHConfig,
         layer_idx: int,
         model_config: ModelConfig | None = None,
         cache_config: CacheConfig | None = None,
@@ -59,31 +201,14 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
             parallel_config=parallel_config,
             prefix=prefix,
         )
-        self.has_start_projections = has_start_projections
-        self.has_end_norm = has_end_norm
-
-        if has_start_projections:
-            self.enorm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-            self.hnorm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-
-            # Fusion layer to combine embeddings with target hidden states
-            self.eh_proj = ColumnParallelLinear(
-                input_size=config.hidden_size * 2,
-                output_size=config.hidden_size,
-                bias=False,
-                gather_output=True,
-                params_dtype=config.dtype
-                if hasattr(config, "dtype")
-                else torch.bfloat16,
-                quant_config=quant_config,
-                prefix=f"{prefix}.eh_proj",
-            )
-
-        if has_end_norm:
-            self.final_layernorm = RMSNorm(
-                config.hidden_size,
-                eps=getattr(config, "layer_norm_epsilon", 1e-5),
-            )
+        self._init_mtp_projections(
+            config,
+            outer_config,
+            quant_config,
+            prefix,
+            has_start_projections,
+            has_end_norm,
+        )
 
     def forward(
         self,
@@ -92,42 +217,22 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # Start projections (Fusion)
-        if self.has_start_projections:
-            # Normalize both inputs before fusion
-            assert inputs_embeds is not None
-            inputs_embeds_normed = self.enorm(inputs_embeds)
-            previous_hidden_states_normed = self.hnorm(hidden_states)
-
-            # Fuse via concatenation and linear projection
-            fused = torch.cat(
-                [inputs_embeds_normed, previous_hidden_states_normed], dim=-1
-            )
-            hidden_states, _ = self.eh_proj(fused)
-
-        # Call parent forward (Attention)
-        # Parent forward expects: hidden_states, residual
+        hidden_states = self._project_mtp_inputs(inputs_embeds, hidden_states)
         hidden_states, residual = super().forward(
             positions=positions,
             hidden_states=hidden_states,
             residual=residual,
         )
-
-        # End norm
-        if self.has_end_norm:
-            if residual is not None:
-                hidden_states = hidden_states + residual
-                residual = None  # Consumed residual
-
-            hidden_states = self.final_layernorm(hidden_states)
-
-        return hidden_states, residual
+        return self._finalize_mtp_outputs(hidden_states, residual)
 
 
-class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
+class NemotronHMTPMLPDecoderLayer(
+    _NemotronHMTPDecoderLayerMixin, NemotronHMLPDecoderLayer
+):
     def __init__(
         self,
         config: NemotronHConfig,
+        outer_config: NemotronHConfig,
         layer_idx: int,
         model_config: ModelConfig | None = None,
         cache_config: CacheConfig | None = None,
@@ -146,31 +251,14 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
             parallel_config=parallel_config,
             prefix=prefix,
         )
-        self.has_start_projections = has_start_projections
-        self.has_end_norm = has_end_norm
-
-        if has_start_projections:
-            self.enorm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-            self.hnorm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-
-            # Fusion layer to combine embeddings with target hidden states
-            self.eh_proj = ColumnParallelLinear(
-                input_size=config.hidden_size * 2,
-                output_size=config.hidden_size,
-                bias=False,
-                gather_output=True,
-                params_dtype=config.dtype
-                if hasattr(config, "dtype")
-                else torch.bfloat16,
-                quant_config=quant_config,
-                prefix=f"{prefix}.eh_proj",
-            )
-
-        if has_end_norm:
-            self.final_layernorm = RMSNorm(
-                config.hidden_size,
-                eps=getattr(config, "layer_norm_epsilon", 1e-5),
-            )
+        self._init_mtp_projections(
+            config,
+            outer_config,
+            quant_config,
+            prefix,
+            has_start_projections,
+            has_end_norm,
+        )
 
     def forward(
         self,
@@ -179,34 +267,61 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # Start projections (Fusion)
-        if self.has_start_projections:
-            # Normalize both inputs before fusion
-            assert inputs_embeds is not None
-            inputs_embeds_normed = self.enorm(inputs_embeds)
-            previous_hidden_states_normed = self.hnorm(hidden_states)
-
-            # Fuse via concatenation and linear projection
-            fused = torch.cat(
-                [inputs_embeds_normed, previous_hidden_states_normed], dim=-1
-            )
-            hidden_states, _ = self.eh_proj(fused)
-
-        # Call parent forward (MoE)
+        hidden_states = self._project_mtp_inputs(inputs_embeds, hidden_states)
         hidden_states, residual = super().forward(
             hidden_states=hidden_states,
             residual=residual,
         )
+        return self._finalize_mtp_outputs(hidden_states, residual)
 
-        # End norm
-        if self.has_end_norm:
-            if residual is not None:
-                hidden_states = hidden_states + residual
-                residual = None  # Consumed residual
 
-            hidden_states = self.final_layernorm(hidden_states)
+class NemotronHMTPMoEDecoderLayer(
+    _NemotronHMTPDecoderLayerMixin, NemotronHMoEDecoderLayer
+):
+    def __init__(
+        self,
+        config: NemotronHConfig,
+        outer_config: NemotronHConfig,
+        layer_idx: int,
+        model_config: ModelConfig | None = None,
+        cache_config: CacheConfig | None = None,
+        quant_config: QuantizationConfig | None = None,
+        parallel_config: ParallelConfig | None = None,
+        prefix: str = "",
+        has_start_projections: bool = False,
+        has_end_norm: bool = False,
+    ) -> None:
+        super().__init__(
+            config=config,
+            layer_idx=layer_idx,
+            model_config=model_config,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            parallel_config=parallel_config,
+            prefix=prefix,
+        )
+        self._init_mtp_projections(
+            config,
+            outer_config,
+            quant_config,
+            prefix,
+            has_start_projections,
+            has_end_norm,
+        )
 
-        return hidden_states, residual
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        hidden_states = self._project_mtp_inputs(inputs_embeds, hidden_states)
+        hidden_states, residual = super().forward(
+            hidden_states=hidden_states,
+            residual=residual,
+        )
+        return self._finalize_mtp_outputs(hidden_states, residual)
 
 
 @support_torch_compile
@@ -231,6 +346,7 @@ class NemotronHMultiTokenPredictor(nn.Module):
         self.pattern_str = config.mtp_hybrid_override_pattern
         self.pattern_len = len(self.pattern_str)
         assert self.pattern_len > 0
+        self.inner_config = _get_mtp_inner_config(config)
 
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
@@ -246,6 +362,11 @@ class NemotronHMultiTokenPredictor(nn.Module):
             step_rel_idx = i % self.pattern_len
 
             char = self.pattern_str[step_rel_idx]
+            layer_config = _get_mtp_layer_config(
+                self.inner_config,
+                config,
+                char,
+            )
 
             is_start_of_step = step_rel_idx == 0
             is_end_of_step = step_rel_idx == self.pattern_len - 1
@@ -254,8 +375,9 @@ class NemotronHMultiTokenPredictor(nn.Module):
 
             # TODO smor- remove double layers formation
             common_kwargs = dict(
-                config=config,
-                layer_idx=self.mtp_start_layer_idx + i,
+                config=layer_config,
+                outer_config=config,
+                layer_idx=step_rel_idx,
                 model_config=vllm_config.model_config,
                 cache_config=vllm_config.cache_config,
                 quant_config=vllm_config.quant_config,
@@ -265,14 +387,17 @@ class NemotronHMultiTokenPredictor(nn.Module):
                 has_end_norm=is_end_of_step,
             )
 
-            if char == "*":
-                self.layers[str(i)] = NemotronHMTPAttentionDecoderLayer(**common_kwargs)
+            if char in ("W", "*"):
+                mtp_decoder_layer_cls = NemotronHMTPAttentionDecoderLayer
+            elif char == "-":
+                mtp_decoder_layer_cls = NemotronHMTPMLPDecoderLayer
             elif char == "E":
-                self.layers[str(i)] = NemotronHMTPMoEDecoderLayer(**common_kwargs)
+                mtp_decoder_layer_cls = NemotronHMTPMoEDecoderLayer
             else:
                 raise NotImplementedError(
                     f"Pattern char '{char}' in {self.pattern_str} not implemented"
                 )
+            self.layers[str(i)] = mtp_decoder_layer_cls(**common_kwargs)
 
         self.make_empty_intermediate_tensors: Callable[..., IntermediateTensors] = (
             make_empty_intermediate_tensors_factory(

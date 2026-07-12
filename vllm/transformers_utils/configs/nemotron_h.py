@@ -53,6 +53,12 @@ class NemotronHConfig(PretrainedConfig):
             M: Mamba2, *: Attention, -: MLP
         mtp_hybrid_override_pattern (`str`, *optional*, defaults to `"*E"`):
             The pattern of the MTP layers.
+        mtp_bottleneck_hidden_size (`int`, *optional*, defaults to `None`):
+            Hidden size of the inner MTP stack. If unset, the MTP stack uses
+            the backbone hidden size.
+        mtp_window_size (`list[int]`, *optional*, defaults to `None`):
+            Left and right window sizes for `W` layers in the MTP pattern.
+            Causal Nemotron-H MTP expects `[positive_window, 0]`.
         num_attention_heads (`int`, *optional*, defaults to 32):
             Number of attention heads for each attention layer in the
             Transformer encoder.
@@ -153,6 +159,8 @@ class NemotronHConfig(PretrainedConfig):
         num_hidden_layers=52,
         hybrid_override_pattern="M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-",
         mtp_hybrid_override_pattern="*E",
+        mtp_bottleneck_hidden_size=None,
+        mtp_window_size=None,
         num_attention_heads=32,
         head_dim=128,
         num_key_value_heads=8,  # nemo: num_query_groups
@@ -207,6 +215,8 @@ class NemotronHConfig(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.hybrid_override_pattern = hybrid_override_pattern
         self.mtp_hybrid_override_pattern = mtp_hybrid_override_pattern
+        self.mtp_bottleneck_hidden_size = mtp_bottleneck_hidden_size
+        self.mtp_window_size = mtp_window_size
         self.num_attention_heads = num_attention_heads
         self.head_dim = head_dim
         self.sliding_window = sliding_window
@@ -222,6 +232,26 @@ class NemotronHConfig(PretrainedConfig):
         assert re.match(r"^[*-ME]+$", self.hybrid_override_pattern), (
             "hybrid_override_pattern must only contain characters 'M', '*', '-', or 'E'"
         )
+        if not re.fullmatch(r"[W*E-]+", self.mtp_hybrid_override_pattern):
+            raise ValueError(
+                "mtp_hybrid_override_pattern must only contain characters "
+                "'W', '*', '-', or 'E'"
+            )
+        if (
+            self.mtp_bottleneck_hidden_size is not None
+            and self.mtp_bottleneck_hidden_size <= 0
+        ):
+            raise ValueError("mtp_bottleneck_hidden_size must be positive")
+        if "W" in self.mtp_hybrid_override_pattern and (
+            self.mtp_window_size is None
+            or len(self.mtp_window_size) != 2
+            or self.mtp_window_size[0] <= 0
+            or self.mtp_window_size[1] != 0
+        ):
+            raise ValueError(
+                "MTP sliding-window attention requires mtp_window_size="
+                "[positive_window, 0]"
+            )
         # for backward compatibility
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
