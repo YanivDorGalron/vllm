@@ -1356,6 +1356,14 @@ class SpeculativeConfig:
             == "step3p5_mtp"
         )
 
+    def use_nemotron_h_mtp(self) -> bool:
+        return (
+            self.method == "mtp"
+            and self.draft_model_config is not None
+            and getattr(self.draft_model_config.hf_config, "model_type", None)
+            == "nemotron_h_mtp"
+        )
+
     def use_eagle(self) -> bool:
         # NOTE: This method is usually a stand-in for "speculative decoding using
         # target model hidden states"
