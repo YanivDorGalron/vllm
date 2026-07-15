@@ -166,7 +166,7 @@ class SpeculativeConfig:
     """Enable parallel drafting, where all speculative tokens are generated
     in parallel rather than sequentially. This can improve performance but
     requires the speculative model be trained to support parallel drafting.
-    Only compatible with EAGLE and draft model methods."""
+    Only compatible with EAGLE, draft model, and supported MTP methods."""
 
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
@@ -1270,6 +1270,7 @@ class SpeculativeConfig:
 
         if not self.use_heterogeneous_vocab:
             self.verify_equal_vocab_size_if_draft_model()
+        self._verify_parallel_drafting_mtp()
         return self
 
     def verify_equal_vocab_size_if_draft_model(self):
@@ -1288,6 +1289,40 @@ class SpeculativeConfig:
                     f"Using models with different tokenizers can cause out-of-bounds "
                     f"errors during speculative decoding."
                 )
+
+    def _verify_parallel_drafting_mtp(self) -> None:
+        if (
+            self.method != "mtp"
+            or not self.parallel_drafting
+            or self.draft_model_config is None
+        ):
+            return
+
+        hf_config = self.draft_model_config.hf_config
+        if getattr(hf_config, "model_type", None) != "nemotron_h_mtp":
+            return
+
+        if not getattr(hf_config, "mtp_naive_parallel_enabled", False):
+            raise ValueError(
+                "Nemotron-H MTP parallel drafting requires a checkpoint that was "
+                "exported with `mtp_naive_parallel_enabled=true`."
+            )
+
+        trained_masked_slots = getattr(hf_config, "mtp_naive_parallel_block_len", 0)
+        if trained_masked_slots <= 0:
+            raise ValueError(
+                "Nemotron-H MTP parallel drafting requires "
+                "`mtp_naive_parallel_block_len > 0` in the checkpoint config."
+            )
+
+        masked_slots = self.num_speculative_tokens - 1
+        if masked_slots > trained_masked_slots:
+            raise ValueError(
+                "Nemotron-H MTP parallel drafting with "
+                f"{self.num_speculative_tokens=} requires {masked_slots} masked "
+                f"slots, but the checkpoint was trained for at most "
+                f"{trained_masked_slots}."
+            )
 
     @property
     def max_num_new_slots_for_drafting(self) -> int:
