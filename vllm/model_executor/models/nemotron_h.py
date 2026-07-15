@@ -54,6 +54,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -414,9 +415,11 @@ class NemotronHAttention(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        use_rope: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.use_rope = use_rope
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % tp_size == 0
@@ -455,6 +458,13 @@ class NemotronHAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        if self.use_rope:
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                max_position=config.max_position_embeddings,
+                rope_parameters=getattr(config, "rope_parameters", None),
+                is_neox_style=True,
+            )
 
         # Get per-layer sliding window from config (for heterogeneous models)
         sliding_window = getattr(config, "sliding_window", None)
@@ -473,10 +483,14 @@ class NemotronHAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        positions: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.use_rope:
+            assert positions is not None
+            q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
@@ -492,6 +506,7 @@ class NemotronHAttentionDecoderLayer(nn.Module):
         quant_config: QuantizationConfig | None = None,
         parallel_config: ParallelConfig | None = None,
         prefix: str = "",
+        use_rope: bool = False,
     ) -> None:
         super().__init__()
 
@@ -506,6 +521,7 @@ class NemotronHAttentionDecoderLayer(nn.Module):
             cache_config,
             quant_config,
             prefix=f"{prefix}.mixer",
+            use_rope=use_rope,
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
@@ -523,7 +539,7 @@ class NemotronHAttentionDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
 
-        hidden_states = self.mixer(hidden_states=hidden_states)
+        hidden_states = self.mixer(hidden_states=hidden_states, positions=positions)
         return hidden_states, residual
 
 

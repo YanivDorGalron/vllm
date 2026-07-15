@@ -315,6 +315,7 @@ def copy_and_expand_eagle_inputs_kernel(
     out_positions_ptr,  # [total_draft_tokens_in_batch] (output)
     out_is_rejected_token_mask_ptr,  # [total_draft_tokens_in_batch] (output)
     out_is_masked_token_mask_ptr,  # [total_draft_tokens_in_batch] (output)
+    out_parallel_drafting_block_offsets_ptr,  # [total_draft_tokens_in_batch] (output)
     out_new_token_indices_ptr,  # [num_padding_slots_per_request * num_reqs] (output)
     out_hidden_state_mapping_ptr,  # [total_tokens_in_batch]
     # Input metadata
@@ -432,6 +433,9 @@ def copy_and_expand_eagle_inputs_kernel(
     new_token_out_idx = (
         request_idx * num_padding_slots_per_request + new_token_local_idx
     )
+    parallel_drafting_block_offset = tl.where(
+        is_parallel_draft_region, new_token_local_idx - 1, -1
+    )
 
     # Compute hidden state mapping (source index -> destination index)
     # This maps each input position to its corresponding output position
@@ -447,6 +451,11 @@ def copy_and_expand_eagle_inputs_kernel(
     tl.store(out_positions_ptr + out_idx, positions, mask=in_bounds)
     tl.store(out_is_rejected_token_mask_ptr + out_idx, is_rejected_out, mask=in_bounds)
     tl.store(out_is_masked_token_mask_ptr + out_idx, is_masked_out, mask=in_bounds)
+    tl.store(
+        out_parallel_drafting_block_offsets_ptr + out_idx,
+        parallel_drafting_block_offset,
+        mask=in_bounds,
+    )
     tl.store(
         out_new_token_indices_ptr + new_token_out_idx,
         out_idx,

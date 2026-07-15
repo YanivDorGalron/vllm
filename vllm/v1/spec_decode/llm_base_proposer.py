@@ -122,7 +122,10 @@ class SpecDecodeBaseProposer:
         self.constant_draft_positions: bool = False
 
         self.parallel_drafting_token_id: int = 0
+        self.parallel_drafting_uses_block_offsets: bool = False
         self.parallel_drafting_hidden_state_tensor: torch.Tensor | None = None
+        self.parallel_drafting_block_offsets: torch.Tensor | None = None
+        self.parallel_drafting_num_actual_tokens: int = 0
         if self.parallel_drafting:
             self._init_parallel_drafting_params()
         self.use_local_argmax_reduction: bool = (
@@ -231,6 +234,10 @@ class SpecDecodeBaseProposer:
             # We populate this tensor even when using draft models for simplicity.
             self.is_masked_token_mask = torch.zeros(
                 (self.max_num_tokens,), dtype=torch.bool, device=device
+            )
+        if self.needs_extra_input_slots or self.parallel_drafting_uses_block_offsets:
+            self.parallel_drafting_block_offsets = torch.full(
+                (self.max_num_tokens,), -1, dtype=torch.int32, device=device
             )
 
         self.inputs_embeds = torch.zeros(
@@ -350,9 +357,26 @@ class SpecDecodeBaseProposer:
         # for those masked slots.
 
         model_hf_config = self.draft_model_config.hf_config
+        self.parallel_drafting_uses_block_offsets = (
+            self.method == "mtp"
+            and getattr(model_hf_config, "model_type", None) == "nemotron_h_mtp"
+            and getattr(model_hf_config, "mtp_naive_parallel_enabled", False)
+        )
+
         # DFlash stores mask_token_id in dflash_config
         dflash_config = getattr(model_hf_config, "dflash_config", None)
-        if dflash_config and "mask_token_id" in dflash_config:
+        if self.parallel_drafting_uses_block_offsets:
+            # Nemotron-H naive-parallel MTP replaces the fused [embed || hidden]
+            # input with learned vectors, so this token is only a placeholder.
+            self.parallel_drafting_token_id = getattr(
+                model_hf_config, "pad_token_id", None
+            )
+            if (
+                not isinstance(self.parallel_drafting_token_id, int)
+                or self.parallel_drafting_token_id < 0
+            ):
+                self.parallel_drafting_token_id = 0
+        elif dflash_config and "mask_token_id" in dflash_config:
             self.parallel_drafting_token_id = dflash_config["mask_token_id"]
         elif hasattr(model_hf_config, "pard_token"):
             self.parallel_drafting_token_id = model_hf_config.pard_token
@@ -366,9 +390,31 @@ class SpecDecodeBaseProposer:
             )
 
         if self.pass_hidden_states_to_model:
-            self.parallel_drafting_hidden_state_tensor = torch.empty(
+            init_fn = (
+                torch.zeros
+                if self.parallel_drafting_uses_block_offsets
+                else torch.empty
+            )
+            self.parallel_drafting_hidden_state_tensor = init_fn(
                 self.hidden_size, dtype=self.dtype, device=self.device
             )
+
+    def _maybe_add_parallel_drafting_model_kwargs(
+        self,
+        model_kwargs: dict[str, Any],
+        num_tokens: int,
+    ) -> None:
+        if not self.parallel_drafting_uses_block_offsets:
+            return
+
+        assert self.parallel_drafting_block_offsets is not None
+        if num_tokens > self.parallel_drafting_num_actual_tokens:
+            self.parallel_drafting_block_offsets[
+                self.parallel_drafting_num_actual_tokens : num_tokens
+            ].fill_(-1)
+        model_kwargs["parallel_drafting_block_offsets"] = (
+            self.parallel_drafting_block_offsets[:num_tokens]
+        )
 
     def _get_positions(self, num_tokens: int):
         if self.uses_mrope:
@@ -856,6 +902,7 @@ class SpecDecodeBaseProposer:
             self._set_positions(num_tokens, target_positions)
 
             self.hidden_states[:num_tokens] = target_hidden_states
+            self.parallel_drafting_num_actual_tokens = num_tokens
 
             return num_tokens, token_indices_to_sample, cad
         else:
@@ -890,6 +937,7 @@ class SpecDecodeBaseProposer:
             out_hidden_state_mapping = torch.empty(
                 total_num_input_tokens, dtype=torch.int32, device=self.device
             )
+            assert self.parallel_drafting_block_offsets is not None
 
             # Kernel grid: one program per request (row)
             grid = (batch_size, num_blocks)
@@ -908,6 +956,9 @@ class SpecDecodeBaseProposer:
                 out_positions_ptr=self.positions,  # Doesn't support mrope for now
                 out_is_rejected_token_mask_ptr=self.is_rejected_token_mask,
                 out_is_masked_token_mask_ptr=self.is_masked_token_mask,
+                out_parallel_drafting_block_offsets_ptr=(
+                    self.parallel_drafting_block_offsets
+                ),
                 out_new_token_indices_ptr=token_indices_to_sample,
                 out_hidden_state_mapping_ptr=out_hidden_state_mapping,
                 # Input metadata
@@ -927,6 +978,11 @@ class SpecDecodeBaseProposer:
                 self.hidden_states[out_hidden_state_mapping] = target_hidden_states
                 # Use torch.where to avoid DtoH sync from boolean indexing
                 mask = self.is_masked_token_mask[:total_num_output_tokens]
+                if self.parallel_drafting_uses_block_offsets:
+                    mask = torch.logical_or(
+                        mask,
+                        self.is_rejected_token_mask[:total_num_output_tokens],
+                    )
                 torch.where(
                     mask.unsqueeze(1),
                     self.parallel_drafting_hidden_state_tensor,
@@ -956,6 +1012,7 @@ class SpecDecodeBaseProposer:
                 arange=self.arange,
                 new_slot_mapping=new_slot_mapping,
             )
+            self.parallel_drafting_num_actual_tokens = total_num_output_tokens
 
             return total_num_output_tokens, token_indices_to_sample, new_cad
 
@@ -965,6 +1022,17 @@ class SpecDecodeBaseProposer:
         num_input_tokens: int,
         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
     ) -> tuple[dict[str, Any], int]:
+        if (
+            self.parallel_drafting_uses_block_offsets
+            and num_input_tokens > num_tokens
+        ):
+            self.input_ids[num_tokens:num_input_tokens].fill_(
+                self.parallel_drafting_token_id
+            )
+            self.positions[num_tokens:num_input_tokens].zero_()
+            if self.pass_hidden_states_to_model:
+                self.hidden_states[num_tokens:num_input_tokens].zero_()
+
         if self.supports_mm_inputs:
             mm_embeds, is_mm_embed = mm_embed_inputs or (None, None)
 
@@ -987,6 +1055,7 @@ class SpecDecodeBaseProposer:
         }
         if self.pass_hidden_states_to_model:
             model_kwargs["hidden_states"] = self.hidden_states[:num_input_tokens]
+        self._maybe_add_parallel_drafting_model_kwargs(model_kwargs, num_input_tokens)
 
         return model_kwargs, num_input_tokens
 
@@ -1407,6 +1476,7 @@ class SpecDecodeBaseProposer:
             self.parallel_drafting
             and self.pass_hidden_states_to_model
             and self.parallel_drafting_hidden_state_tensor is not None
+            and not self.parallel_drafting_uses_block_offsets
         ):
             flat_mask = self.model.mask_hidden.view(-1)
             if self.eagle3_use_aux_hidden_state:
@@ -1417,6 +1487,9 @@ class SpecDecodeBaseProposer:
                 )
             else:
                 self.parallel_drafting_hidden_state_tensor.copy_(flat_mask)
+        elif self.parallel_drafting_uses_block_offsets:
+            assert self.parallel_drafting_hidden_state_tensor is not None
+            self.parallel_drafting_hidden_state_tensor.zero_()
 
     def _maybe_share_embeddings(self, target_language_model: nn.Module) -> None:
         """
@@ -1670,6 +1743,9 @@ class SpecDecodeBaseProposer:
                 )
                 if self.pass_hidden_states_to_model:
                     kwargs["hidden_states"] = self.hidden_states[:num_input_tokens]
+                self._maybe_add_parallel_drafting_model_kwargs(
+                    kwargs, num_input_tokens
+                )
                 self.model(**kwargs)
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
