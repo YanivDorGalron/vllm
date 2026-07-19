@@ -77,7 +77,11 @@ def _create_mtp_proposer(
         ),
     )
 
-    return EagleProposer(vllm_config=vllm_config, device=DEVICE_TYPE)
+    proposer = EagleProposer(vllm_config=vllm_config, device=DEVICE_TYPE)
+    # Production initializes this when the KV cache is attached. Unit tests
+    # exercise propose() directly, so mirror that initialization here.
+    proposer.block_size = 16
+    return proposer
 
 
 @mock.patch("vllm.v1.spec_decode.llm_base_proposer.get_pp_group")
@@ -250,25 +254,17 @@ def test_mtp_parallel_drafting_rejects_more_masked_slots_than_trained():
     draft_model_config.hf_config = draft_hf_config
     draft_model_config.get_vocab_size.return_value = 100
 
-    target_model_config = mock.MagicMock()
-    target_model_config.get_vocab_size.return_value = 100
-    target_model_config.hf_text_config = SimpleNamespace(model_type="nemotron_h")
-
-    speculative_config = SpeculativeConfig.model_construct(
-        num_speculative_tokens=4,
-        method="mtp",
-        parallel_drafting=True,
-        target_model_config=target_model_config,
-        target_parallel_config=ParallelConfig(),
-        draft_model_config=draft_model_config,
-        draft_parallel_config=ParallelConfig(),
-    )
+    speculative_config = object.__new__(SpeculativeConfig)
+    speculative_config.num_speculative_tokens = 4
+    speculative_config.method = "mtp"
+    speculative_config.parallel_drafting = True
+    speculative_config.draft_model_config = draft_model_config
 
     with pytest.raises(
         ValueError,
         match="requires 3 masked slots, but the checkpoint was trained for at most 2",
     ):
-        speculative_config._verify_args()
+        speculative_config._verify_parallel_drafting_mtp()
 
 
 def test_mtp_parallel_drafting_passes_block_offsets_to_model():
@@ -309,7 +305,9 @@ def test_mtp_parallel_drafting_passes_block_offsets_to_model():
             torch.arange(seq_lens[1], device=device),
         ]
     )
-    target_hidden_states = torch.randn(total_tokens, hidden_size, device=device)
+    target_hidden_states = torch.randn(
+        total_tokens, hidden_size, dtype=proposer.dtype, device=device
+    )
     next_token_ids = torch.randint(
         0, vocab_size, (batch_size,), dtype=torch.int32, device=device
     )
