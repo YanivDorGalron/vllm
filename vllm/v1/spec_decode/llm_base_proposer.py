@@ -1022,10 +1022,7 @@ class SpecDecodeBaseProposer:
         num_input_tokens: int,
         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
     ) -> tuple[dict[str, Any], int]:
-        if (
-            self.parallel_drafting_uses_block_offsets
-            and num_input_tokens > num_tokens
-        ):
+        if self.parallel_drafting_uses_block_offsets and num_input_tokens > num_tokens:
             self.input_ids[num_tokens:num_input_tokens].fill_(
                 self.parallel_drafting_token_id
             )
@@ -1743,9 +1740,7 @@ class SpecDecodeBaseProposer:
                 )
                 if self.pass_hidden_states_to_model:
                     kwargs["hidden_states"] = self.hidden_states[:num_input_tokens]
-                self._maybe_add_parallel_drafting_model_kwargs(
-                    kwargs, num_input_tokens
-                )
+                self._maybe_add_parallel_drafting_model_kwargs(kwargs, num_input_tokens)
                 self.model(**kwargs)
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
