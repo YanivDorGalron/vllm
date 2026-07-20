@@ -68,6 +68,19 @@ def test_v2_model_runner_env_tri_state(monkeypatch, env_value, expected):
     assert envs.VLLM_USE_V2_MODEL_RUNNER is expected
 
 
+def test_nemotron_h_parallel_mtp_forces_v2_model_runner(monkeypatch):
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method="mtp",
+            parallel_drafting=True,
+            use_nemotron_h_mtp=lambda: True,
+        )
+    )
+
+    assert VllmConfig.use_v2_model_runner.fget(config)
+
+
 @pytest.mark.parametrize(
     ("use_v2_model_runner", "expected_capture_sizes"),
     [

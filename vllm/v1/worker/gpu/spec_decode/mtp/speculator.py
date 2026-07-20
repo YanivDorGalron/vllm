@@ -121,10 +121,14 @@ class MTPSpeculator(AutoRegressiveSpeculator):
             )
 
         req_state = input_batch.idx_mapping[:num_reqs].to(torch.long)
+        # last_sampled is stored as [max_num_reqs, 1]. Flatten both token
+        # sources so torch.where cannot broadcast across request rows.
+        sampled_tokens = last_sampled.reshape(-1)[req_state]
+        prefill_tokens = next_prefill_tokens.reshape(-1)[req_state]
         bonus_tokens = torch.where(
             num_sampled[:num_reqs] > 0,
-            last_sampled[req_state],
-            next_prefill_tokens[req_state],
+            sampled_tokens,
+            prefill_tokens,
         ).to(torch.int32)
         valid_query_end = input_batch.query_start_loc[1 : num_reqs + 1] - 1
         valid_query_end = valid_query_end - num_rejected[:num_reqs]

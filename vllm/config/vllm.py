@@ -543,6 +543,18 @@ class VllmConfig:
         ):
             return True
 
+        # Nemotron-H parallel MTP is implemented only by the V2 MTP
+        # speculator. Nemotron-H is a hybrid model and otherwise defaults to
+        # the V1 runner, whose generic parallel proposer requires a mask-token
+        # config that these checkpoints do not use.
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and self.speculative_config.parallel_drafting
+            and self.speculative_config.use_nemotron_h_mtp()
+        ):
+            return True
+
         # Mixed sliding/full DFlash drafts need multiple KV groups (V2 only);
         # force V2 as for dspark, since a hybrid target otherwise defaults to V1.
         if self._dflash_needs_multi_kv_group():
