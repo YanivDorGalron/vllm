@@ -2128,11 +2128,16 @@ class VllmConfig:
                 unsupported.append(f"speculative method '{speculative_config.method}'")
 
             # V2 EagleSpeculator does not support parallel_drafting (for P-Eagle).
-            # DFlash and DSpark use parallel drafting natively in V2 via their
-            # own speculators.
+            # DFlash, DSpark, and validated Nemotron-H MTP checkpoints use
+            # dedicated parallel paths in their V2 speculators.
+            uses_parallel_mtp = (
+                speculative_config.method == "mtp"
+                and speculative_config.use_nemotron_h_mtp()
+            )
             if (
                 speculative_config.parallel_drafting
                 and speculative_config.method not in ("dflash", "dspark")
+                and not uses_parallel_mtp
             ):
                 unsupported.append("parallel drafting for EAGLE speculative decoding")
 

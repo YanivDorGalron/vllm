@@ -310,6 +310,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 hidden_states=self.hidden_states[:num_tokens],
                 inputs_embeds=inputs_embeds,
             )
+            model_inputs.update(self._get_additional_model_kwargs(num_tokens))
             if cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
                 # Draft prefill with PIECEWISE cudagraph (compiled PW or breakable),
                 # chosen inside run_pw_graph.
@@ -328,6 +329,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             last_hidden_states = ret_hidden_states
             hidden_states = ret_hidden_states
         return last_hidden_states, hidden_states
+
+    def _get_additional_model_kwargs(self, num_tokens: int) -> dict[str, Any]:
+        return {}
 
     def _prefill(
         self,

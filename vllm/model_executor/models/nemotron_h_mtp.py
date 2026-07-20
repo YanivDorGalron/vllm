@@ -39,6 +39,44 @@ from .nemotron_h import (
 )
 
 
+def _apply_first_step_block_replacement(
+    combined_input: torch.Tensor,
+    parallel_drafting_block_offsets: torch.Tensor | None,
+    first_step_block_replace_vectors: torch.Tensor | None,
+) -> torch.Tensor:
+    if (
+        first_step_block_replace_vectors is None
+        or parallel_drafting_block_offsets is None
+    ):
+        return combined_input
+
+    if parallel_drafting_block_offsets.ndim != 1:
+        raise ValueError(
+            "Expected 1D parallel_drafting_block_offsets for Nemotron-H MTP "
+            f"parallel drafting, got shape "
+            f"{tuple(parallel_drafting_block_offsets.shape)}."
+        )
+    if parallel_drafting_block_offsets.shape[0] != combined_input.shape[0]:
+        raise ValueError(
+            "parallel_drafting_block_offsets must align with the flattened token "
+            f"dimension. Got {parallel_drafting_block_offsets.shape[0]=} and "
+            f"{combined_input.shape[0]=}."
+        )
+
+    num_replace_vectors = first_step_block_replace_vectors.shape[0]
+    if num_replace_vectors == 0:
+        return combined_input
+
+    valid_mask = parallel_drafting_block_offsets.unsqueeze(-1).ge(0)
+    safe_offsets = parallel_drafting_block_offsets.to(torch.long).clamp(
+        min=0,
+        max=num_replace_vectors - 1,
+    )
+    gathered_vectors = first_step_block_replace_vectors.index_select(0, safe_offsets)
+    gathered_vectors = gathered_vectors.to(dtype=combined_input.dtype)
+    return torch.where(valid_mask, gathered_vectors, combined_input)
+
+
 def get_mtp_inner_config(config: NemotronHConfig) -> NemotronHConfig:
     inner_config = copy.deepcopy(config)
     inner_config.hybrid_override_pattern = config.mtp_hybrid_override_pattern
@@ -111,15 +149,20 @@ class _NemotronHMTPDecoderLayerMixin:
         self,
         inputs_embeds: torch.Tensor,
         hidden_states: torch.Tensor,
+        parallel_drafting_block_offsets: torch.Tensor | None = None,
+        first_step_block_replace_vectors: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if not self.has_start_projections:
             return hidden_states
 
         inputs_embeds = self.enorm(inputs_embeds)
         hidden_states = self.hnorm(hidden_states)
-        hidden_states, _ = self.eh_proj(
-            torch.cat([inputs_embeds, hidden_states], dim=-1)
+        combined_input = _apply_first_step_block_replacement(
+            torch.cat([inputs_embeds, hidden_states], dim=-1),
+            parallel_drafting_block_offsets,
+            first_step_block_replace_vectors,
         )
+        hidden_states, _ = self.eh_proj(combined_input)
         return hidden_states
 
     def _apply_end_projections(
@@ -162,6 +205,7 @@ class NemotronHMTPAttentionDecoderLayer(
             quant_config=quant_config,
             parallel_config=parallel_config,
             prefix=prefix,
+            use_rope=bool(getattr(config, "mtp_use_rope", False)),
         )
         self._init_mtp_projections(
             config,
@@ -178,8 +222,15 @@ class NemotronHMTPAttentionDecoderLayer(
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None = None,
+        parallel_drafting_block_offsets: torch.Tensor | None = None,
+        first_step_block_replace_vectors: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        hidden_states = self._apply_start_projections(inputs_embeds, hidden_states)
+        hidden_states = self._apply_start_projections(
+            inputs_embeds,
+            hidden_states,
+            parallel_drafting_block_offsets,
+            first_step_block_replace_vectors,
+        )
         hidden_states, residual = super().forward(
             positions=positions,
             hidden_states=hidden_states,
@@ -228,8 +279,15 @@ class NemotronHMTPMoEDecoderLayer(
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None = None,
+        parallel_drafting_block_offsets: torch.Tensor | None = None,
+        first_step_block_replace_vectors: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        hidden_states = self._apply_start_projections(inputs_embeds, hidden_states)
+        hidden_states = self._apply_start_projections(
+            inputs_embeds,
+            hidden_states,
+            parallel_drafting_block_offsets,
+            first_step_block_replace_vectors,
+        )
         hidden_states, residual = super().forward(
             hidden_states=hidden_states,
             residual=residual,
@@ -277,8 +335,15 @@ class NemotronHMTPMLPDecoderLayer(
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None = None,
+        parallel_drafting_block_offsets: torch.Tensor | None = None,
+        first_step_block_replace_vectors: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        hidden_states = self._apply_start_projections(inputs_embeds, hidden_states)
+        hidden_states = self._apply_start_projections(
+            inputs_embeds,
+            hidden_states,
+            parallel_drafting_block_offsets,
+            first_step_block_replace_vectors,
+        )
         hidden_states, residual = super().forward(
             hidden_states=hidden_states,
             residual=residual,
@@ -308,6 +373,12 @@ class NemotronHMultiTokenPredictor(nn.Module):
         self.pattern_str = config.mtp_hybrid_override_pattern
         self.pattern_len = len(self.pattern_str)
         assert self.pattern_len > 0
+        self.naive_parallel_enabled = getattr(
+            config, "mtp_naive_parallel_enabled", False
+        )
+        self.naive_parallel_block_len = getattr(
+            config, "mtp_naive_parallel_block_len", 0
+        )
 
         inner_config = get_mtp_inner_config(config)
         self.inner_config = inner_config
@@ -316,6 +387,17 @@ class NemotronHMultiTokenPredictor(nn.Module):
             self.vocab_size,
             config.hidden_size,
         )
+
+        if self.naive_parallel_enabled:
+            self.first_step_block_replace_vectors = nn.Parameter(
+                torch.empty(
+                    self.naive_parallel_block_len,
+                    config.hidden_size * 2,
+                    dtype=getattr(config, "dtype", torch.bfloat16),
+                )
+            )
+        else:
+            self.register_parameter("first_step_block_replace_vectors", None)
 
         # Build flat list of layers
         self.layers = torch.nn.ModuleDict()
@@ -380,6 +462,7 @@ class NemotronHMultiTokenPredictor(nn.Module):
         hidden_states: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        parallel_drafting_block_offsets: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings(input_ids)
@@ -392,6 +475,10 @@ class NemotronHMultiTokenPredictor(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
+                parallel_drafting_block_offsets=parallel_drafting_block_offsets,
+                first_step_block_replace_vectors=(
+                    self.first_step_block_replace_vectors
+                ),
             )
         return hidden_states
 
@@ -452,6 +539,7 @@ class NemotronHMTP(nn.Module, SupportsPP):
         hidden_states: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        parallel_drafting_block_offsets: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
         """Forward - applies attention-based MTP."""
@@ -461,6 +549,7 @@ class NemotronHMTP(nn.Module, SupportsPP):
             hidden_states,
             intermediate_tensors,
             inputs_embeds,
+            parallel_drafting_block_offsets,
         )
         return hidden_states
 
@@ -508,7 +597,10 @@ class NemotronHMTP(nn.Module, SupportsPP):
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            name = name.replace("mtp.layers.", "model.layers.")
+            if name == "mtp.first_step_block_replace_vectors":
+                name = "model.first_step_block_replace_vectors"
+            else:
+                name = name.replace("mtp.layers.", "model.layers.")
 
             if "embeddings" in name:
                 name = name.replace("embeddings", "embed_tokens")
@@ -587,5 +679,15 @@ class NemotronHMTP(nn.Module, SupportsPP):
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        if (
+            getattr(self.config, "mtp_naive_parallel_enabled", False)
+            and "model.first_step_block_replace_vectors" not in loaded_params
+        ):
+            raise ValueError(
+                "Checkpoint config enables Nemotron-H MTP parallel drafting, but "
+                "`mtp.first_step_block_replace_vectors` was not found in the "
+                "loaded weights."
+            )
 
         return loaded_params
