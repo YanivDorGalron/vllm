@@ -146,6 +146,7 @@ class MTPSpeculator(AutoRegressiveSpeculator):
             out_positions_ptr=self.input_buffers.positions,
             out_is_rejected_token_mask_ptr=self.is_rejected,
             out_is_masked_token_mask_ptr=self.is_masked,
+            out_parallel_drafting_block_offsets_ptr=self.block_offsets,
             out_new_token_indices_ptr=self.sample_indices,
             out_hidden_state_mapping_ptr=self.hidden_mapping,
             query_start_loc_ptr=input_batch.query_start_loc,

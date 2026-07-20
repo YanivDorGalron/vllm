@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -14,6 +16,7 @@ from tests.v1.attention.utils import (
 )
 from vllm.config import (
     CacheConfig,
+    CUDAGraphMode,
     DeviceConfig,
     ModelConfig,
     ParallelConfig,
@@ -31,7 +34,11 @@ mimo_7b_dir = "XiaomiMiMo/MiMo-7B-Base"
 DEVICE_TYPE = current_platform.device_type
 
 
-def _create_mtp_proposer(num_speculative_tokens: int) -> EagleProposer:
+def _create_mtp_proposer(
+    num_speculative_tokens: int,
+    parallel_drafting: bool = False,
+    naive_parallel_block_len: int | None = None,
+) -> EagleProposer:
     """Create an MTP proposer with unified model configuration."""
     model_config = ModelConfig(
         model=mimo_7b_dir, runner="generate", max_model_len=100, trust_remote_code=True
@@ -43,7 +50,19 @@ def _create_mtp_proposer(num_speculative_tokens: int) -> EagleProposer:
         model=mimo_7b_dir,
         method="mtp",
         num_speculative_tokens=num_speculative_tokens,
+        parallel_drafting=parallel_drafting,
     )
+    if parallel_drafting:
+        hf_config = speculative_config.draft_model_config.hf_config
+        hf_config.model_type = "nemotron_h_mtp"
+        hf_config.__dict__.pop("ptd_token_id", None)
+        hf_config.pad_token_id = 7
+        hf_config.mtp_naive_parallel_enabled = True
+        hf_config.mtp_naive_parallel_block_len = (
+            num_speculative_tokens - 1
+            if naive_parallel_block_len is None
+            else naive_parallel_block_len
+        )
 
     vllm_config = VllmConfig(
         model_config=model_config,
@@ -218,4 +237,289 @@ def test_mtp_propose(num_speculative_tokens, monkeypatch):
     # Verify the model was called correctly
     assert model_mock.called
     # Verify output shape
+    assert result.shape == (batch_size, num_speculative_tokens)
+
+
+def test_mtp_parallel_drafting_rejects_more_masked_slots_than_trained():
+    draft_hf_config = SimpleNamespace(
+        model_type="nemotron_h_mtp",
+        mtp_naive_parallel_enabled=True,
+        mtp_naive_parallel_block_len=2,
+    )
+    draft_model_config = mock.MagicMock()
+    draft_model_config.hf_config = draft_hf_config
+    draft_model_config.get_vocab_size.return_value = 100
+
+    target_model_config = mock.MagicMock()
+    target_model_config.get_vocab_size.return_value = 100
+    target_model_config.hf_text_config = SimpleNamespace(model_type="nemotron_h")
+
+    speculative_config = SimpleNamespace(
+        num_speculative_tokens=4,
+        method="mtp",
+        parallel_drafting=True,
+        target_model_config=target_model_config,
+        target_parallel_config=ParallelConfig(),
+        draft_model_config=draft_model_config,
+        draft_parallel_config=ParallelConfig(),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="requires 3 masked slots, but the checkpoint was trained for at most 2",
+    ):
+        SpeculativeConfig._verify_parallel_drafting_mtp(speculative_config)
+
+
+def test_mtp_parallel_drafting_passes_block_offsets_to_model():
+    device = torch.device(current_platform.device_type)
+    batch_size = 2
+    seq_lens = [4, 3]
+    total_tokens = sum(seq_lens)
+    vocab_size = 100
+    num_speculative_tokens = 4
+
+    proposer = _create_mtp_proposer(
+        num_speculative_tokens=num_speculative_tokens,
+        parallel_drafting=True,
+    )
+    hidden_size = proposer.hidden_size
+    assert proposer.parallel_drafting_token_id == 7
+
+    def mock_forward(**kwargs):
+        num_tokens = kwargs["positions"].shape[0]
+        return torch.zeros(num_tokens, hidden_size, device=device)
+
+    model_mock = mock.MagicMock(side_effect=mock_forward)
+    model_mock.compute_logits.return_value = torch.zeros(
+        batch_size * num_speculative_tokens, vocab_size, device=device
+    )
+    proposer.model = model_mock
+    proposer._draft_attn_layer_names = {"layer.0"}
+
+    batch_spec = BatchSpec(seq_lens=seq_lens, query_lens=seq_lens)
+    common_attn_metadata = create_common_attn_metadata(
+        batch_spec, block_size=16, device=device
+    )
+
+    target_token_ids = torch.randint(0, vocab_size, (total_tokens,), device=device)
+    target_positions = torch.cat(
+        [
+            torch.arange(seq_lens[0], device=device),
+            torch.arange(seq_lens[1], device=device),
+        ]
+    )
+    target_hidden_states = torch.randn(total_tokens, hidden_size, device=device)
+    next_token_ids = torch.randint(
+        0, vocab_size, (batch_size,), dtype=torch.int32, device=device
+    )
+    sampling_metadata = mock.MagicMock()
+
+    attn_metadata_builder_cls, _ = try_get_attention_backend(
+        AttentionBackendEnum.FLASH_ATTN
+    )
+    attn_metadata_builder = attn_metadata_builder_cls(
+        kv_cache_spec=create_standard_kv_cache_spec(proposer.vllm_config),
+        layer_names=list(proposer._draft_attn_layer_names),
+        vllm_config=proposer.vllm_config,
+        device=device,
+    )
+
+    proposer.runner = mock.MagicMock()
+    mock_attn_group = mock.MagicMock()
+    mock_attn_group.get_metadata_builder.return_value = attn_metadata_builder
+    mock_attn_group.layer_names = list(proposer._draft_attn_layer_names)
+    mock_attn_group.kv_cache_spec = attn_metadata_builder.kv_cache_spec
+    proposer.draft_attn_groups = [mock_attn_group]
+
+    result = proposer.propose(
+        num_speculative_tokens=num_speculative_tokens,
+        target_token_ids=target_token_ids,
+        target_positions=target_positions,
+        target_hidden_states=target_hidden_states,
+        next_token_ids=next_token_ids,
+        token_indices_to_sample=None,
+        common_attn_metadata=common_attn_metadata,
+        sampling_metadata=sampling_metadata,
+    )
+
+    assert result.shape == (batch_size, num_speculative_tokens)
+    kwargs = model_mock.call_args.kwargs
+    assert "parallel_drafting_block_offsets" in kwargs
+    expected_offsets = torch.tensor(
+        [-1, -1, -1, -1, 0, 1, 2, -1, -1, -1, 0, 1, 2],
+        dtype=torch.int32,
+        device=device,
+    )
+    assert torch.equal(kwargs["parallel_drafting_block_offsets"], expected_offsets)
+
+
+def test_mtp_parallel_drafting_allocates_offsets_for_single_token():
+    proposer = _create_mtp_proposer(
+        num_speculative_tokens=1,
+        parallel_drafting=True,
+        naive_parallel_block_len=8,
+    )
+
+    assert proposer.parallel_drafting_uses_block_offsets is True
+    assert proposer.needs_extra_input_slots is False
+    assert proposer.parallel_drafting_block_offsets is not None
+
+
+def test_mtp_parallel_drafting_dummy_run_passes_block_offsets(monkeypatch):
+    device = torch.device(current_platform.device_type)
+    num_tokens = 5
+    padded_num_tokens = 8
+    proposer = _create_mtp_proposer(
+        num_speculative_tokens=4,
+        parallel_drafting=True,
+    )
+    proposer.model = mock.MagicMock()
+    proposer._draft_attn_layer_names = set()
+
+    monkeypatch.setattr(
+        proposer,
+        "_determine_batch_execution_and_padding",
+        lambda num_tokens, use_cudagraphs=True: (
+            CUDAGraphMode.NONE,
+            padded_num_tokens,
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        "vllm.v1.spec_decode.llm_base_proposer.set_forward_context",
+        lambda *args, **kwargs: nullcontext(),
+    )
+
+    proposer.dummy_run(
+        num_tokens,
+        use_cudagraphs=False,
+        is_graph_capturing=True,
+    )
+
+    kwargs = proposer.model.call_args.kwargs
+    assert "parallel_drafting_block_offsets" in kwargs
+    assert torch.equal(
+        kwargs["parallel_drafting_block_offsets"],
+        torch.full((padded_num_tokens,), -1, dtype=torch.int32, device=device),
+    )
+
+
+def test_mtp_parallel_drafting_clears_rejected_and_padded_rows(monkeypatch):
+    device = torch.device(current_platform.device_type)
+    batch_size = 2
+    seq_lens = [4, 4]
+    total_tokens = sum(seq_lens)
+    vocab_size = 100
+    num_speculative_tokens = 3
+
+    proposer = _create_mtp_proposer(
+        num_speculative_tokens=num_speculative_tokens,
+        parallel_drafting=True,
+    )
+    hidden_size = proposer.hidden_size
+    padded_num_tokens = 16
+
+    def mock_forward(**kwargs):
+        offsets = kwargs["parallel_drafting_block_offsets"]
+        hidden_states = kwargs["hidden_states"]
+        input_ids = kwargs["input_ids"]
+
+        assert torch.equal(
+            offsets[12:padded_num_tokens],
+            torch.full(
+                (padded_num_tokens - 12,),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            ),
+        )
+        assert torch.equal(
+            hidden_states[5],
+            torch.zeros(hidden_size, dtype=hidden_states.dtype, device=device),
+        )
+        assert torch.equal(
+            hidden_states[12:padded_num_tokens],
+            torch.zeros(
+                (padded_num_tokens - 12, hidden_size),
+                dtype=hidden_states.dtype,
+                device=device,
+            ),
+        )
+        assert torch.equal(
+            input_ids[12:padded_num_tokens],
+            torch.full(
+                (padded_num_tokens - 12,),
+                proposer.parallel_drafting_token_id,
+                dtype=torch.int32,
+                device=device,
+            ),
+        )
+        return torch.zeros(padded_num_tokens, hidden_size, device=device)
+
+    model_mock = mock.MagicMock(side_effect=mock_forward)
+    model_mock.compute_logits.return_value = torch.zeros(
+        batch_size * num_speculative_tokens, vocab_size, device=device
+    )
+    proposer.model = model_mock
+    proposer._draft_attn_layer_names = {"layer.0"}
+
+    batch_spec = BatchSpec(seq_lens=seq_lens, query_lens=seq_lens)
+    common_attn_metadata = create_common_attn_metadata(
+        batch_spec, block_size=16, device=device
+    )
+
+    target_token_ids = torch.tensor(
+        [10, 11, 12, 13, 20, 21, 22, 23],
+        dtype=torch.int32,
+        device=device,
+    )
+    target_positions = torch.tensor(
+        [5, 6, 7, 8, 10, 11, 12, 13],
+        dtype=torch.int64,
+        device=device,
+    )
+    target_hidden_states = torch.arange(
+        total_tokens * hidden_size,
+        dtype=proposer.dtype,
+        device=device,
+    ).view(total_tokens, hidden_size)
+    next_token_ids = torch.tensor([100, 200], dtype=torch.int32, device=device)
+    num_rejected_tokens_gpu = torch.tensor([1, 0], dtype=torch.int32, device=device)
+    sampling_metadata = mock.MagicMock()
+
+    attn_metadata_builder_cls, _ = try_get_attention_backend(
+        AttentionBackendEnum.FLASH_ATTN
+    )
+    attn_metadata_builder = attn_metadata_builder_cls(
+        kv_cache_spec=create_standard_kv_cache_spec(proposer.vllm_config),
+        layer_names=list(proposer._draft_attn_layer_names),
+        vllm_config=proposer.vllm_config,
+        device=device,
+    )
+
+    proposer.runner = mock.MagicMock()
+    mock_attn_group = mock.MagicMock()
+    mock_attn_group.get_metadata_builder.return_value = attn_metadata_builder
+    mock_attn_group.layer_names = list(proposer._draft_attn_layer_names)
+    mock_attn_group.kv_cache_spec = attn_metadata_builder.kv_cache_spec
+    proposer.draft_attn_groups = [mock_attn_group]
+    monkeypatch.setattr(
+        proposer,
+        "_determine_batch_execution_and_padding",
+        lambda num_tokens: (CUDAGraphMode.FULL, padded_num_tokens, None),
+    )
+
+    result = proposer.propose(
+        num_speculative_tokens=num_speculative_tokens,
+        target_token_ids=target_token_ids,
+        target_positions=target_positions,
+        target_hidden_states=target_hidden_states,
+        next_token_ids=next_token_ids,
+        token_indices_to_sample=None,
+        common_attn_metadata=common_attn_metadata,
+        sampling_metadata=sampling_metadata,
+        num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+    )
+
     assert result.shape == (batch_size, num_speculative_tokens)

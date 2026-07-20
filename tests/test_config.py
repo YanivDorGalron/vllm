@@ -81,6 +81,19 @@ def test_nemotron_h_parallel_mtp_forces_v2_model_runner(monkeypatch):
     assert VllmConfig.use_v2_model_runner.fget(config)
 
 
+def test_nemotron_h_parallel_mtp_allows_explicit_v1_model_runner(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method="mtp",
+            parallel_drafting=True,
+            use_nemotron_h_mtp=lambda: True,
+        )
+    )
+
+    assert not VllmConfig.use_v2_model_runner.fget(config)
+
+
 @pytest.mark.parametrize(
     ("use_v2_model_runner", "expected_capture_sizes"),
     [

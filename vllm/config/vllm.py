@@ -543,10 +543,10 @@ class VllmConfig:
         ):
             return True
 
-        # Nemotron-H parallel MTP is implemented only by the V2 MTP
-        # speculator. Nemotron-H is a hybrid model and otherwise defaults to
-        # the V1 runner, whose generic parallel proposer requires a mask-token
-        # config that these checkpoints do not use.
+        # Prefer the dedicated V2 MTP speculator for Nemotron-H parallel MTP.
+        # Nemotron-H is a hybrid model and would otherwise default to V1.
+        # An explicit VLLM_USE_V2_MODEL_RUNNER=0 remains supported by the V1
+        # proposer's learned block-offset replacement path.
         if (
             self.speculative_config is not None
             and self.speculative_config.method == "mtp"

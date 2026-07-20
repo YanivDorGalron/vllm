@@ -51,6 +51,12 @@ def test_parallel_expansion_preserves_prefix_and_bonus_token_shape(monkeypatch):
         "copy_and_expand_eagle_inputs_kernel",
         expand_kernel,
     )
+    monkeypatch.setattr(
+        spec_module.triton,
+        "next_power_of_2",
+        lambda value: 1 << (value - 1).bit_length(),
+        raising=False,
+    )
 
     input_batch = SimpleNamespace(
         num_reqs=2,
@@ -75,6 +81,10 @@ def test_parallel_expansion_preserves_prefix_and_bonus_token_shape(monkeypatch):
     )
 
     assert expand_kernel.kwargs is not None
+    assert (
+        expand_kernel.kwargs["out_parallel_drafting_block_offsets_ptr"]
+        is speculator.block_offsets
+    )
     bonus_tokens = expand_kernel.kwargs["next_token_ids_ptr"]
     assert bonus_tokens.shape == (2,)
     assert torch.equal(bonus_tokens, torch.tensor([101, 302], dtype=torch.int32))
