@@ -15,7 +15,7 @@ from vllm.config.parallel import ParallelConfig
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
-from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -23,7 +23,10 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.model_loader.weight_utils import (
+    default_weight_loader,
+    sharded_weight_loader,
+)
 from vllm.model_executor.models.utils import (
     make_empty_intermediate_tensors_factory,
     maybe_prefix,
@@ -96,6 +99,19 @@ def get_mtp_inner_config(config: NemotronHConfig) -> NemotronHConfig:
 
     inner_config.intermediate_size = scale_ffn_size(config.intermediate_size)
     inner_config.moe_intermediate_size = scale_ffn_size(config.moe_intermediate_size)
+    if getattr(config, "mtp_scale_shared_expert_with_bottleneck", False):
+        inner_config.moe_shared_expert_intermediate_size = scale_ffn_size(
+            config.moe_shared_expert_intermediate_size
+        )
+    if getattr(config, "mtp_dense_mlp_match_moe_active_params", False):
+        shared_width = inner_config.moe_shared_expert_intermediate_size
+        if not getattr(config, "mtp_scale_shared_expert_with_bottleneck", False):
+            shared_width = scale_ffn_size(shared_width)
+        active_width = (
+            inner_config.num_experts_per_tok * inner_config.moe_intermediate_size
+            + shared_width
+        )
+        inner_config.intermediate_size = (active_width + 31) // 32 * 32
     return inner_config
 
 
@@ -111,6 +127,9 @@ class _NemotronHMTPDecoderLayerMixin:
     ) -> None:
         self.has_start_projections = has_start_projections
         self.has_end_norm = has_end_norm
+        self.use_bottleneck_lm_head = bool(
+            getattr(outer_config, "mtp_use_bottleneck_lm_head", False)
+        )
 
         if has_start_projections:
             self.enorm = RMSNorm(
@@ -140,12 +159,15 @@ class _NemotronHMTPDecoderLayerMixin:
                     quant_config=quant_config,
                     prefix=f"{prefix}.he_proj",
                 )
-            self.final_layernorm = LayerNorm(
+            self.final_layernorm = RMSNorm(
                 outer_config.hidden_size,
                 eps=outer_config.layer_norm_epsilon,
             )
-            if not outer_config.mlp_bias:
-                self.final_layernorm.bias = None
+            if self.use_bottleneck_lm_head:
+                self.bottleneck_final_layernorm = RMSNorm(
+                    config.hidden_size,
+                    eps=outer_config.layer_norm_epsilon,
+                )
 
     def _apply_start_projections(
         self,
@@ -172,16 +194,19 @@ class _NemotronHMTPDecoderLayerMixin:
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         if not self.has_end_norm:
-            return hidden_states, residual
+            return hidden_states, residual, None
 
         if residual is not None:
             hidden_states = hidden_states + residual
             residual = None
+        lm_head_hidden_states = None
+        if self.use_bottleneck_lm_head:
+            lm_head_hidden_states = self.bottleneck_final_layernorm(hidden_states)
         if hasattr(self, "he_proj"):
             hidden_states, _ = self.he_proj(hidden_states)
-        return self.final_layernorm(hidden_states), residual
+        return self.final_layernorm(hidden_states), residual, lm_head_hidden_states
 
 
 class NemotronHMTPAttentionDecoderLayer(
@@ -227,7 +252,7 @@ class NemotronHMTPAttentionDecoderLayer(
         residual: torch.Tensor | None = None,
         parallel_drafting_block_offsets: torch.Tensor | None = None,
         first_step_block_replace_vectors: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         hidden_states = self._apply_start_projections(
             inputs_embeds,
             hidden_states,
@@ -284,7 +309,7 @@ class NemotronHMTPMoEDecoderLayer(
         residual: torch.Tensor | None = None,
         parallel_drafting_block_offsets: torch.Tensor | None = None,
         first_step_block_replace_vectors: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         hidden_states = self._apply_start_projections(
             inputs_embeds,
             hidden_states,
@@ -340,7 +365,7 @@ class NemotronHMTPMLPDecoderLayer(
         residual: torch.Tensor | None = None,
         parallel_drafting_block_offsets: torch.Tensor | None = None,
         first_step_block_replace_vectors: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         hidden_states = self._apply_start_projections(
             inputs_embeds,
             hidden_states,
@@ -420,6 +445,9 @@ class NemotronHMultiTokenPredictor(nn.Module):
             layer_config.sliding_window = (
                 config.mtp_window_size[0] if char == "W" else None
             )
+            layer_config.mtp_attention_softmax_type = (
+                config.mtp_softmax_type if char in ("*", "W") else "vanilla"
+            )
 
             # TODO smor- remove double layers formation
             common_kwargs = dict(
@@ -466,14 +494,15 @@ class NemotronHMultiTokenPredictor(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         parallel_drafting_block_offsets: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings(input_ids)
 
         residual = None
+        lm_head_hidden_states = None
 
         for i in range(self.pattern_len):
-            hidden_states, residual = self.layers[str(i)](
+            hidden_states, residual, layer_lm_head_hidden_states = self.layers[str(i)](
                 inputs_embeds=inputs_embeds,
                 positions=positions,
                 hidden_states=hidden_states,
@@ -483,6 +512,13 @@ class NemotronHMultiTokenPredictor(nn.Module):
                     self.first_step_block_replace_vectors
                 ),
             )
+            if layer_lm_head_hidden_states is not None:
+                lm_head_hidden_states = layer_lm_head_hidden_states
+        if self.config.mtp_use_bottleneck_lm_head:
+            assert lm_head_hidden_states is not None
+            # MRV2 uses the first tensor for logits and feeds the second back
+            # into the next autoregressive MTP step.
+            return lm_head_hidden_states, hidden_states
         return hidden_states
 
 
@@ -503,6 +539,9 @@ class NemotronHMTP(nn.Module, SupportsPP):
         self.vllm_config = vllm_config
         self.config = config
         self.quant_config = vllm_config.quant_config
+        # MRV2 normally aliases the draft head to the target head. U configs
+        # export a separately trained bottleneck-width head, so preserve it.
+        self.has_own_lm_head = bool(config.mtp_use_bottleneck_lm_head)
 
         # Needed for load_weights mapping
         self.mtp_start_layer_idx = config.num_hidden_layers
@@ -522,8 +561,17 @@ class NemotronHMTP(nn.Module, SupportsPP):
         # LM head for generating logits
         self.lm_head = ParallelLMHead(
             self.config.vocab_size,
-            self.config.hidden_size,
-            prefix=maybe_prefix(prefix, "lm_head"),
+            (
+                self.config.mtp_bottleneck_hidden_size
+                if self.config.mtp_use_bottleneck_lm_head
+                else self.config.hidden_size
+            ),
+            prefix=maybe_prefix(
+                prefix,
+                "mtp.output_layer"
+                if self.config.mtp_use_bottleneck_lm_head
+                else "lm_head",
+            ),
         )
 
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
@@ -544,7 +592,7 @@ class NemotronHMTP(nn.Module, SupportsPP):
         inputs_embeds: torch.Tensor | None = None,
         parallel_drafting_block_offsets: torch.Tensor | None = None,
         **kwargs: object,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Forward - applies attention-based MTP."""
         hidden_states = self.model(
             input_ids,
@@ -591,17 +639,23 @@ class NemotronHMTP(nn.Module, SupportsPP):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        unconsumed_mtp_weights: set[str] = set()
 
         for name, loaded_weight in weights:
+            checkpoint_name = name
             # Only process MTP weights - skip all non-MTP weights
             if not name.startswith("mtp.") and "embeddings" not in name:
                 continue
             # Skip rotary embeddings (computed, not loaded)
             if "rotary_emb.inv_freq" in name:
                 continue
+            if checkpoint_name.startswith("mtp."):
+                unconsumed_mtp_weights.add(checkpoint_name)
 
             if name == "mtp.first_step_block_replace_vectors":
                 name = "model.first_step_block_replace_vectors"
+            elif name == "mtp.output_layer.weight":
+                name = "lm_head.weight"
             else:
                 name = name.replace("mtp.layers.", "model.layers.")
 
@@ -634,6 +688,7 @@ class NemotronHMTP(nn.Module, SupportsPP):
                 if weight_loader is not None:
                     weight_loader(param, loaded_weight, shard_id)
                     loaded_params.add(stacked_name)
+                    unconsumed_mtp_weights.discard(checkpoint_name)
                 break
 
             if is_stacked:
@@ -667,12 +722,27 @@ class NemotronHMTP(nn.Module, SupportsPP):
                 )
                 if success:
                     loaded_params.add(name_mapped)
+                    unconsumed_mtp_weights.discard(checkpoint_name)
                 break
 
             if is_expert_weight:
+                # Expert-parallel ranks receive the full checkpoint iterator but
+                # only materialize their local experts. Reaching this branch means
+                # the tensor matched a known expert mapping and belongs elsewhere.
+                unconsumed_mtp_weights.discard(checkpoint_name)
+                continue
+
+            if name.endswith(".mixer.sinks"):
+                if name not in params_dict:
+                    continue
+                param = params_dict[name]
+                sharded_weight_loader(0)(param, loaded_weight)
+                loaded_params.add(name)
+                unconsumed_mtp_weights.discard(checkpoint_name)
                 continue
 
             if name.endswith(".bias") and name not in params_dict:
+                unconsumed_mtp_weights.discard(checkpoint_name)
                 continue
 
             if name not in params_dict:
@@ -682,6 +752,31 @@ class NemotronHMTP(nn.Module, SupportsPP):
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
+            unconsumed_mtp_weights.discard(checkpoint_name)
+
+        if unconsumed_mtp_weights:
+            raise ValueError(
+                "Nemotron-H MTP checkpoint tensors were not consumed: "
+                f"{sorted(unconsumed_mtp_weights)[:20]}"
+            )
+
+        required_params = set()
+        if self.config.mtp_use_bottleneck_lm_head:
+            required_params.add("lm_head.weight")
+            required_params.add(
+                f"model.layers.{self.model.pattern_len - 1}."
+                "bottleneck_final_layernorm.weight"
+            )
+        if self.config.mtp_softmax_type == "learnable":
+            for layer_idx, symbol in enumerate(self.model.pattern_str):
+                if symbol in ("W", "*"):
+                    required_params.add(f"model.layers.{layer_idx}.mixer.sinks")
+        missing_required = required_params - loaded_params
+        if missing_required:
+            raise ValueError(
+                "Nemotron-H MTP feature tensors were not loaded: "
+                f"{sorted(missing_required)}"
+            )
 
         if (
             getattr(self.config, "mtp_naive_parallel_enabled", False)
