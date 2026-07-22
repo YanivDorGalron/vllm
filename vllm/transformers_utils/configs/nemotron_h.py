@@ -162,6 +162,10 @@ class NemotronHConfig(PretrainedConfig):
         num_nextn_predict_layers=0,
         mtp_bottleneck_hidden_size=None,
         mtp_window_size=None,
+        mtp_use_bottleneck_lm_head=False,
+        mtp_scale_shared_expert_with_bottleneck=False,
+        mtp_dense_mlp_match_moe_active_params=False,
+        mtp_softmax_type="vanilla",
         num_attention_heads=32,
         head_dim=128,
         num_key_value_heads=8,  # nemo: num_query_groups
@@ -219,6 +223,14 @@ class NemotronHConfig(PretrainedConfig):
         self.num_nextn_predict_layers = num_nextn_predict_layers
         self.mtp_bottleneck_hidden_size = mtp_bottleneck_hidden_size
         self.mtp_window_size = mtp_window_size
+        self.mtp_use_bottleneck_lm_head = mtp_use_bottleneck_lm_head
+        self.mtp_scale_shared_expert_with_bottleneck = (
+            mtp_scale_shared_expert_with_bottleneck
+        )
+        self.mtp_dense_mlp_match_moe_active_params = (
+            mtp_dense_mlp_match_moe_active_params
+        )
+        self.mtp_softmax_type = mtp_softmax_type
         self.num_attention_heads = num_attention_heads
         self.head_dim = head_dim
         self.sliding_window = sliding_window
@@ -243,6 +255,15 @@ class NemotronHConfig(PretrainedConfig):
             assert 0 < self.mtp_bottleneck_hidden_size <= self.hidden_size, (
                 "mtp_bottleneck_hidden_size must be in (0, hidden_size]"
             )
+        if self.mtp_use_bottleneck_lm_head:
+            assert self.mtp_bottleneck_hidden_size is not None, (
+                "mtp_use_bottleneck_lm_head requires mtp_bottleneck_hidden_size"
+            )
+        if self.mtp_scale_shared_expert_with_bottleneck:
+            assert self.mtp_bottleneck_hidden_size is not None, (
+                "mtp_scale_shared_expert_with_bottleneck requires a bottleneck"
+            )
+        assert self.mtp_softmax_type in ("vanilla", "off-by-one", "learnable")
         if "W" in self.mtp_hybrid_override_pattern:
             assert (
                 self.mtp_window_size is not None and len(self.mtp_window_size) == 2
