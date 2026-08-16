@@ -446,7 +446,9 @@ class NemotronHMultiTokenPredictor(nn.Module):
                 config.mtp_window_size[0] if char == "W" else None
             )
             layer_config.mtp_attention_softmax_type = (
-                config.mtp_softmax_type if char in ("*", "W") else "vanilla"
+                getattr(config, "mtp_softmax_type", "vanilla")
+                if char in ("*", "W")
+                else "vanilla"
             )
 
             # TODO smor- remove double layers formation
@@ -514,7 +516,7 @@ class NemotronHMultiTokenPredictor(nn.Module):
             )
             if layer_lm_head_hidden_states is not None:
                 lm_head_hidden_states = layer_lm_head_hidden_states
-        if self.config.mtp_use_bottleneck_lm_head:
+        if getattr(self.config, "mtp_use_bottleneck_lm_head", False):
             assert lm_head_hidden_states is not None
             # MRV2 uses the first tensor for logits and feeds the second back
             # into the next autoregressive MTP step.
@@ -541,7 +543,9 @@ class NemotronHMTP(nn.Module, SupportsPP):
         self.quant_config = vllm_config.quant_config
         # MRV2 normally aliases the draft head to the target head. U configs
         # export a separately trained bottleneck-width head, so preserve it.
-        self.has_own_lm_head = bool(config.mtp_use_bottleneck_lm_head)
+        self.has_own_lm_head = bool(
+            getattr(config, "mtp_use_bottleneck_lm_head", False)
+        )
 
         # Needed for load_weights mapping
         self.mtp_start_layer_idx = config.num_hidden_layers
@@ -563,13 +567,13 @@ class NemotronHMTP(nn.Module, SupportsPP):
             self.config.vocab_size,
             (
                 self.config.mtp_bottleneck_hidden_size
-                if self.config.mtp_use_bottleneck_lm_head
+                if self.has_own_lm_head
                 else self.config.hidden_size
             ),
             prefix=maybe_prefix(
                 prefix,
                 "mtp.output_layer"
-                if self.config.mtp_use_bottleneck_lm_head
+                if self.has_own_lm_head
                 else "lm_head",
             ),
         )
@@ -761,13 +765,13 @@ class NemotronHMTP(nn.Module, SupportsPP):
             )
 
         required_params = set()
-        if self.config.mtp_use_bottleneck_lm_head:
+        if self.has_own_lm_head:
             required_params.add("lm_head.weight")
             required_params.add(
                 f"model.layers.{self.model.pattern_len - 1}."
                 "bottleneck_final_layernorm.weight"
             )
-        if self.config.mtp_softmax_type == "learnable":
+        if getattr(self.config, "mtp_softmax_type", "vanilla") == "learnable":
             for layer_idx, symbol in enumerate(self.model.pattern_str):
                 if symbol in ("W", "*"):
                     required_params.add(f"model.layers.{layer_idx}.mixer.sinks")
