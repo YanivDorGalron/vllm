@@ -181,6 +181,7 @@ class RequestState:
         # Routed experts accumulation (prompt + sample chunks)
         self.routed_experts_chunks: list[np.ndarray] = []
         self.sampling_mask_chunks: list[SamplingMaskLists] = []
+        self.scheduler_step_token_counts: list[int] = []
 
         # Stream Interval
         self.stream_interval = stream_interval
@@ -288,6 +289,9 @@ class RequestState:
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
 
+        if new_token_ids:
+            self.scheduler_step_token_counts.append(len(new_token_ids))
+
         if not finished and final_only:
             # Only the final output is required in FINAL_ONLY mode.
             return None
@@ -324,7 +328,14 @@ class RequestState:
                 finished,
             )
 
-        output = self._new_completion_output(new_token_ids, finish_reason, stop_reason)
+        scheduler_step_token_counts = self.scheduler_step_token_counts
+        self.scheduler_step_token_counts = []
+        output = self._new_completion_output(
+            new_token_ids,
+            finish_reason,
+            stop_reason,
+            scheduler_step_token_counts,
+        )
 
         if self.parent_req is None:
             outputs = [output]
@@ -393,6 +404,7 @@ class RequestState:
         token_ids: list[int],
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
+        scheduler_step_token_counts: list[int],
     ) -> CompletionOutput:
         assert self.detokenizer is not None
         assert self.logprobs_processor is not None
@@ -429,6 +441,7 @@ class RequestState:
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
             finish_reason=str(finish_reason) if finished else None,
             stop_reason=stop_reason if finished else None,
+            scheduler_step_token_counts=scheduler_step_token_counts,
         )
 
     def _new_pooling_output(self, pooling_output: torch.Tensor) -> PoolingOutput:

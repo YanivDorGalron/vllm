@@ -60,6 +60,11 @@ class CompletionOutput:
     stop_reason: int | str | None = None
     lora_request: LoRARequest | None = None
     sampling_mask: SamplingMask | None = None
+    # Token counts emitted by each scheduler iteration represented in this
+    # completion. RequestOutputCollector may coalesce several engine outputs
+    # before an async consumer observes them, so this metadata preserves the
+    # original speculative-decoding chunk boundaries.
+    scheduler_step_token_counts: list[int] | None = None
 
     def finished(self) -> bool:
         return self.finish_reason is not None
@@ -188,8 +193,20 @@ class RequestOutput:
                         )
                         completion.finish_reason = next_completion.finish_reason
                         completion.stop_reason = next_completion.stop_reason
+                        if next_completion.scheduler_step_token_counts:
+                            if completion.scheduler_step_token_counts is None:
+                                completion.scheduler_step_token_counts = []
+                            completion.scheduler_step_token_counts.extend(
+                                next_completion.scheduler_step_token_counts
+                            )
                     else:
                         # Replace the output with the new one
+                        if completion.scheduler_step_token_counts:
+                            if next_completion.scheduler_step_token_counts is None:
+                                next_completion.scheduler_step_token_counts = []
+                            next_completion.scheduler_step_token_counts[:0] = (
+                                completion.scheduler_step_token_counts
+                            )
                         self.outputs[i] = next_completion
                     break
             else:
