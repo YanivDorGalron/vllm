@@ -19,6 +19,17 @@ logger = init_logger(__name__)
 
 
 @dataclass
+class SamplingMask:
+    """Per-token sampling support sets aligned with completion token IDs.
+
+    Each inner list contains the vocabulary token IDs that survived
+    top-k / top-p / min-p filtering for the corresponding generated token.
+    """
+
+    token_ids: list[list[int]]
+
+
+@dataclass
 class CompletionOutput:
     """The output data of one completion output of a request.
 
@@ -30,6 +41,8 @@ class CompletionOutput:
             output text.
         logprobs: The log probabilities of the top probability words at each
             position if the logprobs are requested.
+        sampling_mask: The post-processing token support set for each generated
+            token, if requested.
         finish_reason: The reason why the sequence is finished.
         stop_reason: The stop string or token id that caused the completion
             to stop, None if the completion finished for some other reason
@@ -46,6 +59,12 @@ class CompletionOutput:
     finish_reason: str | None = None
     stop_reason: int | str | None = None
     lora_request: LoRARequest | None = None
+    sampling_mask: SamplingMask | None = None
+    # Token counts emitted by each scheduler iteration represented in this
+    # completion. RequestOutputCollector may coalesce several engine outputs
+    # before an async consumer observes them, so this metadata preserves the
+    # original speculative-decoding chunk boundaries.
+    scheduler_step_token_counts: list[int] | None = None
 
     def finished(self) -> bool:
         return self.finish_reason is not None
@@ -56,6 +75,7 @@ class CompletionOutput:
             f"text={self.text!r}, "
             f"token_ids={self.token_ids}, "
             f"routed_experts={self.routed_experts}, "
+            f"sampling_mask={self.sampling_mask}, "
             f"cumulative_logprob={self.cumulative_logprob}, "
             f"logprobs={self.logprobs}, "
             f"finish_reason={self.finish_reason}, "
@@ -173,8 +193,20 @@ class RequestOutput:
                         )
                         completion.finish_reason = next_completion.finish_reason
                         completion.stop_reason = next_completion.stop_reason
+                        if next_completion.scheduler_step_token_counts:
+                            if completion.scheduler_step_token_counts is None:
+                                completion.scheduler_step_token_counts = []
+                            completion.scheduler_step_token_counts.extend(
+                                next_completion.scheduler_step_token_counts
+                            )
                     else:
                         # Replace the output with the new one
+                        if completion.scheduler_step_token_counts:
+                            if next_completion.scheduler_step_token_counts is None:
+                                next_completion.scheduler_step_token_counts = []
+                            next_completion.scheduler_step_token_counts[:0] = (
+                                completion.scheduler_step_token_counts
+                            )
                         self.outputs[i] = next_completion
                     break
             else:
@@ -236,7 +268,7 @@ class PoolingRequestOutput(Generic[_O]):
         self.finished = finished
         self.outputs = outputs
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             f"{type(self).__name__}(request_id={self.request_id!r}, "
             f"outputs={self.outputs!r}, "
@@ -258,7 +290,7 @@ class EmbeddingOutput:
     embedding: list[float]
 
     @staticmethod
-    def from_base(pooling_output: PoolingOutput):
+    def from_base(pooling_output: PoolingOutput) -> "EmbeddingOutput":
         pooled_data = pooling_output.data
         if pooled_data.ndim != 1:
             raise ValueError("pooled_data should be a 1-D embedding vector")
@@ -275,7 +307,9 @@ class EmbeddingOutput:
 
 class EmbeddingRequestOutput(PoolingRequestOutput[EmbeddingOutput]):
     @staticmethod
-    def from_base(request_output: PoolingRequestOutput):
+    def from_base(
+        request_output: PoolingRequestOutput,
+    ) -> "EmbeddingRequestOutput":
         return EmbeddingRequestOutput(
             request_id=request_output.request_id,
             outputs=EmbeddingOutput.from_base(request_output.outputs),
@@ -297,7 +331,7 @@ class ClassificationOutput:
     probs: list[float]
 
     @staticmethod
-    def from_base(pooling_output: PoolingOutput):
+    def from_base(pooling_output: PoolingOutput) -> "ClassificationOutput":
         # pooling_output shape: (num_classes)
         pooled_data = pooling_output.data
         if pooled_data.ndim != 1:
@@ -315,7 +349,9 @@ class ClassificationOutput:
 
 class ClassificationRequestOutput(PoolingRequestOutput[ClassificationOutput]):
     @staticmethod
-    def from_base(request_output: PoolingRequestOutput):
+    def from_base(
+        request_output: PoolingRequestOutput,
+    ) -> "ClassificationRequestOutput":
         return ClassificationRequestOutput(
             request_id=request_output.request_id,
             outputs=ClassificationOutput.from_base(request_output.outputs),
@@ -336,7 +372,7 @@ class ScoringOutput:
     score: float
 
     @staticmethod
-    def from_base(pooling_output: PoolingOutput):
+    def from_base(pooling_output: PoolingOutput) -> "ScoringOutput":
         # pooling_output shape:
         #   classify task: (num_classes) num_classes == 1
         #   embed task: a scalar value
@@ -352,7 +388,9 @@ class ScoringOutput:
 
 class ScoringRequestOutput(PoolingRequestOutput[ScoringOutput]):
     @staticmethod
-    def from_base(request_output: PoolingRequestOutput):
+    def from_base(
+        request_output: PoolingRequestOutput,
+    ) -> "ScoringRequestOutput":
         return ScoringRequestOutput(
             request_id=request_output.request_id,
             outputs=ScoringOutput.from_base(request_output.outputs),

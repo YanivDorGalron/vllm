@@ -94,6 +94,7 @@ def test_incremental_detokenization(
 
     gen_strings = {}
     gen_tokens = {}
+    scheduler_step_token_counts = {}
     while True:
         # Mock output from the EngineCore.
         outputs = engine_core.get_outputs()
@@ -111,6 +112,9 @@ def test_incremental_detokenization(
             request_id = request_output.request_id
             new_text = request_output.outputs[0].text
             new_tokens = request_output.outputs[0].token_ids
+            step_counts = request_output.outputs[0].scheduler_step_token_counts
+            assert step_counts is not None
+            scheduler_step_token_counts.setdefault(request_id, []).extend(step_counts)
             if request_id not in gen_strings:
                 gen_strings[request_id] = new_text
                 gen_tokens[request_id] = new_tokens
@@ -136,6 +140,9 @@ def test_incremental_detokenization(
 
         assert gen_str == ref_gen_str, f"{gen_str=}, {ref_gen_str=}"
         assert gen_toks == ref_gen_toks, f"{gen_toks=}, {ref_gen_toks=}"
+        assert scheduler_step_token_counts[f"request-{idx}"] == [1] * len(
+            ref_gen_toks
+        )
 
     assert output_processor.get_num_unfinished_requests() == 0
     assert not output_processor.has_unfinished_requests()
@@ -1238,6 +1245,7 @@ async def test_request_output_collector():
                         cumulative_logprob=(idx + 1 * 1.0),
                         logprobs=[{"a": idx, "b": idx}],
                         finish_reason="length" if (idx == NUM_REQS - 1) else None,
+                        scheduler_step_token_counts=[idx + 1],
                     )
                 ],
                 finished=(idx == NUM_REQS - 1),
@@ -1273,6 +1281,7 @@ async def test_request_output_collector():
     for tok_0, tok_1 in zip(output.outputs[0].token_ids, list(range(num_to_put))):
         assert tok_0 == tok_1
     assert len(output.outputs[0].logprobs) == num_to_put
+    assert output.outputs[0].scheduler_step_token_counts == [1, 2]
 
     # Cumulative logprobs should be the last one.
     cumulative_logprob_expected = 1.0 * num_to_put
@@ -1294,6 +1303,7 @@ async def test_request_output_collector():
     for tok_0, tok_1 in zip(output.outputs[0].token_ids, list(range(num_to_put))):
         assert tok_0 == tok_1
     assert len(output.outputs[0].logprobs) == num_to_put
+    assert output.outputs[0].scheduler_step_token_counts == [1, 2, 3]
 
     # Cumulative logprobs should be the last one.
     cumulative_logprob_expected = 1.0 * num_to_put
@@ -1320,6 +1330,7 @@ async def test_cumulative_output_collector_n():
                     cumulative_logprob=None,
                     logprobs=None,
                     finish_reason=None,
+                    scheduler_step_token_counts=[1],
                 ),
                 CompletionOutput(
                     index=1,
@@ -1328,6 +1339,7 @@ async def test_cumulative_output_collector_n():
                     cumulative_logprob=None,
                     logprobs=None,
                     finish_reason=None,
+                    scheduler_step_token_counts=[1],
                 ),
             ],
             finished=False,
@@ -1345,6 +1357,7 @@ async def test_cumulative_output_collector_n():
                     cumulative_logprob=None,
                     logprobs=None,
                     finish_reason=None,
+                    scheduler_step_token_counts=[3],
                 ),
                 CompletionOutput(
                     index=2,
@@ -1353,6 +1366,7 @@ async def test_cumulative_output_collector_n():
                     cumulative_logprob=None,
                     logprobs=None,
                     finish_reason=None,
+                    scheduler_step_token_counts=[1],
                 ),
             ],
             finished=False,
@@ -1370,6 +1384,7 @@ async def test_cumulative_output_collector_n():
     first = [k for k in result.outputs if k.index == 0]
     assert len(first) == 1
     assert first[0].text == "ab"
+    assert first[0].scheduler_step_token_counts == [1, 3]
 
     # Second is the one where index is 1
     second = [k for k in result.outputs if k.index == 1]

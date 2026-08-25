@@ -17,6 +17,7 @@ from vllm.outputs import (
     PoolingOutput,
     PoolingRequestOutput,
     RequestOutput,
+    SamplingMask,
 )
 from vllm.sampling_params import RequestOutputKind
 from vllm.tokenizers import TokenizerLike
@@ -37,6 +38,7 @@ from vllm.v1.metrics.stats import (
     RequestStateStats,
     SchedulerStats,
 )
+from vllm.v1.outputs import SamplingMaskLists
 
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
@@ -178,6 +180,8 @@ class RequestState:
 
         # Routed experts accumulation (prompt + sample chunks)
         self.routed_experts_chunks: list[np.ndarray] = []
+        self.sampling_mask_chunks: list[SamplingMaskLists] = []
+        self.scheduler_step_token_counts: list[int] = []
 
         # Stream Interval
         self.stream_interval = stream_interval
@@ -285,6 +289,9 @@ class RequestState:
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
 
+        if new_token_ids:
+            self.scheduler_step_token_counts.append(len(new_token_ids))
+
         if not finished and final_only:
             # Only the final output is required in FINAL_ONLY mode.
             return None
@@ -321,7 +328,14 @@ class RequestState:
                 finished,
             )
 
-        output = self._new_completion_output(new_token_ids, finish_reason, stop_reason)
+        scheduler_step_token_counts = self.scheduler_step_token_counts
+        self.scheduler_step_token_counts = []
+        output = self._new_completion_output(
+            new_token_ids,
+            finish_reason,
+            stop_reason,
+            scheduler_step_token_counts,
+        )
 
         if self.parent_req is None:
             outputs = [output]
@@ -390,6 +404,7 @@ class RequestState:
         token_ids: list[int],
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
+        scheduler_step_token_counts: list[int],
     ) -> CompletionOutput:
         assert self.detokenizer is not None
         assert self.logprobs_processor is not None
@@ -406,6 +421,11 @@ class RequestState:
         if delta and logprobs:
             logprobs = logprobs[-len(token_ids) :]
 
+        sampling_mask = None
+        if finished and self.sampling_mask_chunks:
+            merged = SamplingMaskLists.merge(self.sampling_mask_chunks)
+            sampling_mask = SamplingMask(merged.to_nested_list())
+
         # Concatenate routed experts on finish
         routed_experts = None
         if finished and self.routed_experts_chunks:
@@ -416,10 +436,12 @@ class RequestState:
             text=text,
             token_ids=token_ids,
             routed_experts=routed_experts,
+            sampling_mask=sampling_mask,
             logprobs=logprobs,
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
             finish_reason=str(finish_reason) if finished else None,
             stop_reason=stop_reason if finished else None,
+            scheduler_step_token_counts=scheduler_step_token_counts,
         )
 
     def _new_pooling_output(self, pooling_output: torch.Tensor) -> PoolingOutput:
@@ -652,6 +674,10 @@ class OutputProcessor:
             if pooling_output is None:
                 assert req_state.detokenizer is not None
                 assert req_state.logprobs_processor is not None
+                if engine_core_output.new_sampling_mask is not None:
+                    req_state.sampling_mask_chunks.append(
+                        engine_core_output.new_sampling_mask
+                    )
                 # 2) Detokenize the token ids into text and perform stop checks.
                 stop_string = req_state.detokenizer.update(
                     new_token_ids, finish_reason == FinishReason.STOP
