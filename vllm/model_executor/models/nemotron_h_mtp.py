@@ -350,6 +350,10 @@ class NemotronHMTP(nn.Module, SupportsPP):
         self.vllm_config = vllm_config
         self.config = config
         self.quant_config = vllm_config.quant_config
+        logger.info(
+            "Constructing Nemotron MTP with mtp_window_size=%s.",
+            getattr(config, "mtp_window_size", None),
+        )
 
         # Needed for load_weights mapping
         self.mtp_start_layer_idx = config.num_hidden_layers
