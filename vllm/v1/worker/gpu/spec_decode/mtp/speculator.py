@@ -3,6 +3,8 @@
 
 import torch.nn as nn
 
+from vllm.config import replace
+from vllm.model_executor.models.utils import get_draft_quant_config
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
 )
@@ -17,13 +19,15 @@ class MTPSpeculator(AutoRegressiveSpeculator):
         target_model: nn.Module,
         target_attn_layer_names: set[str],
     ) -> nn.Module:
-        draft_model = load_eagle_model(target_model, self.vllm_config)
         spec_config = self.vllm_config.speculative_config
-        draft_hf_config = (
-            spec_config.draft_model_config.hf_config
-            if spec_config is not None
-            else None
+        assert spec_config is not None
+        draft_vllm_config = replace(
+            self.vllm_config,
+            model_config=spec_config.draft_model_config,
         )
+        draft_vllm_config.quant_config = get_draft_quant_config(self.vllm_config)
+        draft_model = load_eagle_model(target_model, draft_vllm_config)
+        draft_hf_config = spec_config.draft_model_config.hf_config
         # Detect index_share_for_mtp_iteration. When True, the proposer
         # toggles skip_topk so step 0 computes MTP's own indices and
         # steps 1+ reuse them.

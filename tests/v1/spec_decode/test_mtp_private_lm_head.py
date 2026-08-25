@@ -17,6 +17,7 @@ from vllm.model_executor.layers.quantization.modelopt import (
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.nemotron_h_mtp import NemotronHMTP
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
+from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 
 
 def _config(*, method: str, share: bool) -> SpeculativeConfig:
@@ -356,3 +357,53 @@ def test_modelopt_w4a16_constructs_packed_parallel_lm_head() -> None:
     assert tuple(head.weight.shape) == (64, 16)
     assert tuple(head.weight_scale.shape) == (64, 2)
     assert tuple(head.weight_scale_2.shape) == (1,)
+
+
+@pytest.mark.parametrize("use_external_draft", [False, True])
+def test_v2_mtp_uses_draft_model_and_quant_config(
+    use_external_draft: bool,
+) -> None:
+    target_quant_config = object()
+    draft_quant_config = object()
+    target_model_config = SimpleNamespace(hf_config=SimpleNamespace())
+    external_model_config = SimpleNamespace(hf_config=SimpleNamespace())
+    draft_model_config = (
+        external_model_config if use_external_draft else target_model_config
+    )
+    vllm_config = SimpleNamespace(
+        model_config=target_model_config,
+        quant_config=target_quant_config,
+        speculative_config=SimpleNamespace(
+            draft_model_config=draft_model_config
+        ),
+    )
+    draft_vllm_config = SimpleNamespace(quant_config=target_quant_config)
+    draft_model = SimpleNamespace(model=SimpleNamespace())
+    target_model = nn.Module()
+    speculator = object.__new__(MTPSpeculator)
+    speculator.vllm_config = vllm_config
+
+    with (
+        mock.patch(
+            "vllm.v1.worker.gpu.spec_decode.mtp.speculator.replace",
+            return_value=draft_vllm_config,
+        ) as replace_config,
+        mock.patch(
+            "vllm.v1.worker.gpu.spec_decode.mtp.speculator."
+            "get_draft_quant_config",
+            return_value=draft_quant_config,
+        ),
+        mock.patch(
+            "vllm.v1.worker.gpu.spec_decode.mtp.speculator.load_eagle_model",
+            return_value=draft_model,
+        ) as load_eagle_model,
+    ):
+        result = speculator.load_draft_model(target_model, set())
+
+    assert result is draft_model
+    replace_config.assert_called_once_with(
+        vllm_config,
+        model_config=draft_model_config,
+    )
+    assert draft_vllm_config.quant_config is draft_quant_config
+    load_eagle_model.assert_called_once_with(target_model, draft_vllm_config)
